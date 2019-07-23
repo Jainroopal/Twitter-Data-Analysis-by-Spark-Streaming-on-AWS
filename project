@@ -1,0 +1,49 @@
+%we first need to make sure all we have all the necessary imports. Fortunately, for this project, we only need a few.
+
+// Only needed for utilities for streaming from Twitter.
+import com.google.gson.Gson
+import org.apache.spark.streaming.twitter.TwitterUtils
+import org.apache.spark.streaming._
+import org.apache.spark.streaming.twitter._
+import org.apache.spark.storage.StorageLevel
+import scala.io.Source
+import scala.collection.mutable.HashMap
+import java.io.File
+import org.apache.log4j.Logger
+import org.apache.log4j.Level
+import sys.process.stringSeqToProcess
+
+In our main function, we can now configure Spark's streaming resources. The Spark config is straightforward, but creating the StreamingContext object takes an additional parameter called the batch interval. This interval should be set such that your cluster can process the data in less time than the interval, and it can have big implications for the rest of your system if set too low. Additionally, the batch interval provides a lower bound on how granular your real-time computation can be (e.g., no faster than every 15 seconds). We use 15 here as a conservative estimate.
+
+// Use the config to create a streaming context that creates a new RDD
+// with a batch interval of every 15 seconds.
+$val ssc = new StreamingContext(sc, Seconds(15))
+
+We then use the Spark streaming context to create our Twitter stream (though we won't connect to it just yet). Spark is nice in giving us easy utility functions to create this stream. The None object refers to authentication information, which we leave blank to force Twitter4j's default authentication (i.e., use the twitter4j.properties file). The createStream() function can also take a set of filter keywords as well, but we omit that here. For more information, see the TwitterUtils API.
+$val stream = TwitterUtils.createStream(ssc, None)
+
+Our next goal is to define the operations on the batches of tweets Spark Streaming gives us. Since we want to count hashtags, our first step is to extract hashtags from each tweet.
+
+$val hashTags = stream.flatMap(status => status.getText.split(" ").filter(_.startsWith("#")))
+
+We then map each twitter4j.HashtagEntity object to a pair containing the "#" symbol, the text of the hashtag, and 1, which we will use in our reduction for counting.To count the occurrences for a given hashtag pair, we would use reduceByKeyAndwindow(), but since we are using Spark streaming, we can also make use of its sliding window capabilities and instead use reduceByKeyAndWindow(). This function also takes a time parameter to control how many previous RDDs it uses when performing its reduceByKeyAndwindow operation. In this case, we're only looking at the past 30(or 120) seconds of RDDs, and since our batch interval is 15 seconds, we're only looking at the past two RDDs.
+
+$val topCounts120 = hashTags.map((_, 1)).reduceByKeyAndWindow(_ + _, Seconds(120)).map{case (topic, count) => (count, topic)}.transform(_.sortByKey(false))
+$val topCounts30 = hashTags.map((_, 1)).reduceByKeyAndWindow(_ + _, Seconds(30)).map{case (topic, count) => (count, topic)}.transform(_.sortByKey(false))
+
+For each of these sorted RDDs, we want to print the top 10 most popular hashtags. The foreachRDD() function makes this step easy, and we simply take the first 10 pairs from the RDD using take(10) and print them out.
+
+topCounts120.foreachRDD(rdd => {
+  val topList = rdd.take(10)
+  println("\nPopular topics in last 120 seconds (%s total):".format(rdd.count()))
+  topList.foreach{case (count, tag) => println("%s (%s tweets)".format(tag, count))}
+})
+
+topCounts30.foreachRDD(rdd => {
+  val topList = rdd.take(10)
+  println("\nPopular topics in last 30 seconds (%s total):".format(rdd.count()))
+  topList.foreach{case (count, tag) => println("%s (%s tweets)".format(tag, count))}
+})
+// Finally, start the streaming operation and continue until killed.
+ssc.start()
+ssc.awaitTermination()
